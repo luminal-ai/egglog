@@ -1717,7 +1717,7 @@ impl EGraph {
                     panic!("Globals should have been desugared away: {name} = {contents}")
                 }
                 _ => {
-                    self.eval_actions(&ResolvedActions::new(vec![action.clone()]))?;
+                    self.eval_actions(&ResolvedActions::new(vec![action]))?;
                 }
             },
             ResolvedNCommand::Extract(span, expr, variants) => {
@@ -2150,8 +2150,14 @@ impl EGraph {
                             .extend(resolved.desugared_before_proofs.clone());
                     }
 
-                    desugared_before_proofs.extend(resolved.desugared_before_proofs);
-                    desugared.extend(resolved.desugared.clone());
+                    // Execution callers only need outputs. Do not retain a
+                    // second copy of every resolved expression until the entire
+                    // input program finishes. Resolution/proof-check callers
+                    // still receive the complete command streams.
+                    if !run_commands {
+                        desugared_before_proofs.extend(resolved.desugared_before_proofs);
+                        desugared.extend(resolved.desugared.clone());
+                    }
 
                     for processed in resolved.desugared {
                         // even in desugar mode we still run push and pop
