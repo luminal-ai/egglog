@@ -74,33 +74,16 @@ space for known rows before insertion. A differential representative-sequence
 test covers singleton and multi-node classes; snapshot tests cover projection,
 subsumption, global bindings and structural invalidation.
 
-`serialize_compact_filtered` exports numeric compiler snapshots directly from
-the database. It preserves the diagnostic serializer's row order, representative
-rotation, canonical values, costs, subsumption and global annotations. Schema
-lookups are cached, class representatives are inline, operands use one arena,
-and cached decimal keys plus radix ordering preserve lexical extraction ties.
-Identity remapping edits the packed rows in place. Original diagnostic labels
-are reconstructed only when a renderer needs them.
+## External snapshot ownership
 
-`refresh_compact_subsumption` validates only changed tables when a graph-scoped
-proof establishes unchanged database identity, union state, table generations,
-append positions and live row counts. Database clones receive distinct identities;
-snapshot edits, archive reloads and changed union state require full validation.
-Changed rows are checked by canonical input/output identities and all flag
-updates are transactional. Explicitly omitted new annotations are rechecked on
-every call. Structural changes still require export. Representative lookup uses
-the union table's direct column API instead of materializing a pooled row.
+The compact format, exporter, refresh policy and associated tests are owned by
+`luminal-ai/luminal_trainium` in `crates/trainium-snapshot`. Egglog retains a
+read-only `SnapshotReader` for canonical values, function rows, schema costs,
+container representations and database/table versions. This interface does
+not depend on any compiler snapshot format. Egglog continues to depend on the
+unmodified crates.io `egraph-serialize` 0.3.0 diagnostic format.
 
-## Repository extraction
-
-These patches were extracted without algorithm changes from
-`luminal-ai/luminal_trainium` commit
-`f39babf9a2f7f2998b5226fbc5745c117cef5f77` (PR #63). The base remains
+These patches were extracted from Trainium commit
+`f39babf9a2f7f2998b5226fbc5745c117cef5f77` on top of
 `1bb30831e11121bd639caf93d84465d8d110e3f7`, including Luminal's subsumed-insert
-support. Upstream files omitted from the Trainium vendor tree are retained here.
-
-The companion patched `egraph-serialize` 0.3.0 is a workspace member because
-the compact export API uses its numeric snapshot types. Its source, fixtures,
-license and patch notes are retained under `egraph-serialize/`. Consumers that
-also depend on `egraph-serialize` must select this workspace package at the same
-Git revision so snapshot types share one package identity.
+support. Upstream files omitted from the Trainium vendor tree remain intact.

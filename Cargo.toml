@@ -3,7 +3,6 @@ resolver = "3"
 members = [
   "concurrency",
   "core-relations",
-  "egraph-serialize",
   "egglog-ast",
   "egglog-bridge",
   "numeric-id",
@@ -23,7 +22,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 clap = "4"
-egraph-serialize = { path = "egraph-serialize", version = "0.3.0", default-features = false }
+egraph-serialize = { version = "0.3.0", default-features = false }
 env_logger = "0.11"
 hashbrown = "0.16"
 im-rc = "15.1.0"

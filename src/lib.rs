@@ -13,7 +13,7 @@ mod proofs;
 
 pub mod scheduler;
 mod serialize;
-mod compact_serialize;
+pub mod snapshot;
 pub mod sort;
 mod termdag;
 mod typechecking;
