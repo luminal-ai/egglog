@@ -13,6 +13,7 @@ mod proofs;
 
 pub mod scheduler;
 mod serialize;
+mod compact_serialize;
 pub mod sort;
 mod termdag;
 mod typechecking;
@@ -1200,6 +1201,40 @@ impl EGraph {
     }
 
     fn eval_actions(&mut self, actions: &ResolvedActions) -> Result<(), Error> {
+        // A resolved constructor tree cannot fail or inspect mutable tables
+        // except for already initialized globals. Interpret these ingestion
+        // actions directly instead of compiling and running a temporary join
+        // query for each top-level fact. Retain one flush per action, so later
+        // commands observe exactly the same canonicalized rows.
+        if self.proof_state.original_typechecking.is_none()
+            && actions.len() == 1
+            && self.direct_constructor_action(actions.iter().next().unwrap())
+        {
+            use crate::exec_state::{Core, Write};
+            return self.update(|mut state| {
+                match actions.iter().next().unwrap() {
+                    ResolvedAction::Expr(_, expr) => {
+                        state.eval_resolved_expr(expr, &[])
+                            .expect("admitted constructor expression is total");
+                    }
+                    ResolvedAction::Set(_, ResolvedCall::Func(function), inputs, expr) => {
+                        let keys = inputs.iter().map(|input|
+                            state.eval_resolved_expr(input, &[])
+                                .expect("admitted constructor key is total")
+                        ).collect();
+                        let value = state.eval_resolved_expr(expr, &[])
+                            .expect("admitted constructor expression is total");
+                        state.set(&function.name, crate::api::RawValues(keys), value)?;
+                    }
+                    _ => unreachable!("admitted constructor action"),
+                }
+                Ok(())
+            });
+        }
+        self.eval_actions_compiled(actions)
+    }
+
+    fn eval_actions_compiled(&mut self, actions: &ResolvedActions) -> Result<(), Error> {
         let mut binding = IndexSet::default();
         let mut ctx = CoreActionContext::new(
             &self.type_info,
@@ -1223,6 +1258,36 @@ impl EGraph {
         match result {
             Ok(_) => Ok(()),
             Err(e) => Err(Error::BackendError(e.to_string())),
+        }
+    }
+
+    fn direct_constructor_action(&self, action: &ResolvedAction) -> bool {
+        fn total(graph: &EGraph, expr: &ResolvedExpr) -> bool {
+            match expr {
+                ResolvedExpr::Lit(..) => true,
+                ResolvedExpr::Call(_, ResolvedCall::Func(function), inputs) => {
+                    (function.subtype == FunctionSubtype::Constructor
+                        || (inputs.is_empty()
+                            && graph.functions.get(&function.name).is_some_and(|f|
+                                f.decl.internal_let && graph.backend.table_size(f.backend_id) == 1)))
+                        && inputs.iter().all(|input| total(graph, input))
+                }
+                _ => false,
+            }
+        }
+        match action {
+            ResolvedAction::Expr(_, expr @ ResolvedExpr::Call(_, ResolvedCall::Func(f), _)) => {
+                f.subtype == FunctionSubtype::Constructor && total(self, expr)
+            }
+            ResolvedAction::Set(_, ResolvedCall::Func(f), inputs, expr) => {
+                // The same table insert/merge machinery runs at this action's
+                // flush. Only key/value evaluation is bypassed; each expression
+                // is a total constructor tree or an initialized global lookup.
+                f.subtype == FunctionSubtype::Custom
+                    && inputs.iter().all(|input| total(self, input))
+                    && total(self, expr)
+            }
+            _ => false,
         }
     }
 
@@ -1569,63 +1634,89 @@ impl EGraph {
     }
 
     fn check_facts(&mut self, span: &Span, facts: &[ResolvedFact]) -> Result<(), Error> {
-        let fresh_name = self.parser.symbol_gen.fresh("check_facts");
-        let fresh_ruleset = self.parser.symbol_gen.fresh("check_facts_ruleset");
-        let rule = ast::ResolvedRule {
-            span: span.clone(),
-            head: ResolvedActions::default(),
-            body: facts.to_vec(),
-            name: fresh_name.clone(),
-            ruleset: fresh_ruleset.clone(),
-            eval_mode: RuleEvalMode::default(),
-            no_decomp: false,
-            include_subsumed: false,
-        };
-        let core_rule = rule.to_canonicalized_core_rule(
-            &self.type_info,
-            &mut self.parser.symbol_gen,
-            self.proof_state.original_typechecking.is_none(),
-        )?;
-        let query = core_rule.body;
+        self.check_facts_batch(&[(span.clone(), facts.to_vec())])
+    }
 
-        let ext_sc = egglog_bridge::SideChannel::default();
-        let ext_sc_ref = ext_sc.clone();
-        let ext_id = self
-            .backend
-            .register_external_func(Box::new(make_external_func(move |_, _| {
-                *ext_sc_ref.lock().unwrap() = Some(());
-                Some(Value::new_const(0))
-            })));
+    /// Independent, read-only checks can share one backend round. In particular,
+    /// do not rebuild all indexes once per output in a large compiler boundary.
+    fn check_facts_batch(&mut self, checks: &[(Span, Vec<ResolvedFact>)]) -> Result<(), Error> {
+        let mut pending = Vec::with_capacity(checks.len());
+        let prepared = (|| -> Result<(), Error> {
+            for (span, facts) in checks {
+                let fresh_name = self.parser.symbol_gen.fresh("check_facts");
+                let fresh_ruleset = self.parser.symbol_gen.fresh("check_facts_ruleset");
+                let rule = ast::ResolvedRule {
+                    span: span.clone(),
+                    head: ResolvedActions::default(),
+                    body: facts.to_vec(),
+                    name: fresh_name.clone(),
+                    ruleset: fresh_ruleset.clone(),
+                    eval_mode: RuleEvalMode::default(),
+                    no_decomp: false,
+                    include_subsumed: false,
+                };
+                let core_rule = rule.to_canonicalized_core_rule(
+                    &self.type_info,
+                    &mut self.parser.symbol_gen,
+                    self.proof_state.original_typechecking.is_none(),
+                )?;
+                let query = core_rule.body;
 
-        let mut translator = BackendRule::new(
-            self.backend.new_rule("check_facts", false),
-            &self.functions,
-            &self.type_info,
-            true, // global query: Read context (may read the DB)
-        );
-        translator.query(&query, true)?;
-        translator
-            .rb
-            .call_external_func(ext_id, &[], egglog_bridge::ColumnTy::Id, || {
-                "this function will never panic".to_string()
-            });
-        let id = translator.build();
-        let run_result = self.backend.run_rules(&[id], Some(&self.type_info));
-        self.backend.free_rule(id);
-        self.backend.free_external_func(ext_id);
-        run_result.map_err(|e| Error::BackendError(e.to_string()))?;
-
-        let ext_sc_val = ext_sc.lock().unwrap().take();
-        let matched = matches!(ext_sc_val, Some(()));
-
-        if !matched {
-            Err(Error::CheckError(
-                facts.iter().map(|f| f.clone().make_unresolved()).collect(),
-                span.clone(),
-            ))
-        } else {
+                let ext_sc = egglog_bridge::SideChannel::default();
+                let ext_sc_ref = ext_sc.clone();
+                let ext_id = self
+                    .backend
+                    .register_external_func(Box::new(make_external_func(move |_, _| {
+                        *ext_sc_ref.lock().unwrap() = Some(());
+                        Some(Value::new_const(0))
+                    })));
+                let mut translator = BackendRule::new(
+                    self.backend.new_rule("check_facts", false),
+                    &self.functions,
+                    &self.type_info,
+                    true, // global query: Read context (may read the DB)
+                );
+                if let Err(error) = translator.query(&query, true) {
+                    drop(translator);
+                    self.backend.free_external_func(ext_id);
+                    return Err(error);
+                }
+                translator
+                    .rb
+                    .call_external_func(ext_id, &[], egglog_bridge::ColumnTy::Id, || {
+                        "this function will never panic".to_string()
+                    });
+                let id = translator.build();
+                pending.push((id, ext_id, ext_sc));
+            }
             Ok(())
+        })();
+        if let Err(error) = prepared {
+            for (id, ext_id, _) in pending {
+                self.backend.free_rule(id);
+                self.backend.free_external_func(ext_id);
+            }
+            return Err(error);
         }
+        let ids: Vec<_> = pending.iter().map(|(id, _, _)| *id).collect();
+        let run_result = self.backend.run_rules(&ids, Some(&self.type_info));
+        for (id, ext_id, _) in &pending {
+            self.backend.free_rule(*id);
+            self.backend.free_external_func(*ext_id);
+        }
+        run_result.map_err(|e| Error::BackendError(e.to_string()))?;
+        for ((span, facts), (_, _, ext_sc)) in checks.iter().zip(pending) {
+            let ext_sc_val = ext_sc.lock().unwrap().take();
+            let matched = matches!(ext_sc_val, Some(()));
+
+            if !matched {
+                return Err(Error::CheckError(
+                    facts.iter().map(|f| f.clone().make_unresolved()).collect(),
+                    span.clone(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn run_command(&mut self, command: ResolvedNCommand) -> Result<Vec<CommandOutput>, Error> {
@@ -2149,8 +2240,15 @@ impl EGraph {
                             .extend(resolved.desugared_before_proofs.clone());
                     }
 
-                    desugared_before_proofs.extend(resolved.desugared_before_proofs);
-                    desugared.extend(resolved.desugared.clone());
+                    // Execution callers only consume outputs; retaining a
+                    // second complete resolved AST costs time and memory for
+                    // large fact streams. Resolution/proof-checking callers
+                    // still receive every command, and proof execution keeps
+                    // its own history above.
+                    if !run_commands {
+                        desugared_before_proofs.extend(resolved.desugared_before_proofs);
+                        desugared.extend(resolved.desugared.clone());
+                    }
 
                     for processed in resolved.desugared {
                         // even in desugar mode we still run push and pop
@@ -2180,6 +2278,47 @@ impl EGraph {
     pub fn run_program(&mut self, program: Vec<Command>) -> Result<Vec<CommandOutput>, Error> {
         let res = self.process_program_internal(program, true)?;
         Ok(res.outputs)
+    }
+
+    /// Run a compiler's postcondition checks in one read-only backend round.
+    /// Consecutive checks share a round; every intervening command is a strict
+    /// boundary and runs normally. Proof instrumentation keeps the sequential
+    /// path. Each block is typechecked first and failed queries are reported
+    /// in source order, just as in `run_program`.
+    pub fn run_checks_batched(
+        &mut self,
+        program: Vec<Command>,
+    ) -> Result<Vec<CommandOutput>, Error> {
+        if self.are_proofs_enabled() {
+            return self.run_program(program);
+        }
+        let mut checks = Vec::new();
+        let mut outputs = Vec::new();
+        for command in program {
+            if matches!(command, Command::Check(..)) {
+                checks.push(command);
+            } else {
+                self.run_check_block(std::mem::take(&mut checks))?;
+                outputs.extend(self.run_program(vec![command])?);
+            }
+        }
+        self.run_check_block(checks)?;
+        Ok(outputs)
+    }
+
+    fn run_check_block(&mut self, program: Vec<Command>) -> Result<(), Error> {
+        if program.is_empty() {
+            return Ok(());
+        }
+        let resolved = self.process_program_internal(program, false)?;
+        let mut checks = Vec::with_capacity(resolved.resolved.len());
+        for command in resolved.resolved {
+            match command {
+                ResolvedNCommand::Check(span, facts) => checks.push((span, facts)),
+                _ => unreachable!("proof-free check resolves to a check"),
+            }
+        }
+        self.check_facts_batch(&checks)
     }
 
     /// Resolves an egglog program by parsing, typechecking, and desugaring each command.
@@ -2419,7 +2558,8 @@ impl EGraph {
         // it unless the closure actually wrote, keeping reads as cheap as a
         // direct backend scan.
         if changed {
-            self.backend.flush_updates();
+            self.backend.flush_updates_checked()
+                .map_err(|error| Error::BackendError(error.to_string()))?;
         }
         result
     }
@@ -2951,6 +3091,45 @@ mod tests {
     use crate::*;
 
     use crate::PureState;
+
+    #[test]
+    fn direct_constructor_ingestion_matches_compiled_actions() {
+        let text = "(datatype T (Leaf i64) (Pair T T))
+            (relation Seen (T)) (function absent () T :no-merge)
+            (function label (T) i64 :no-merge)
+            (function minimum (T) i64 :merge (min old new))
+            (let x (Leaf 3)) (let n 7) (let y (Pair x (Leaf n)))
+            (set (label x) 7) (set (label (Leaf 3)) n)
+            (set (minimum (Pair x (Leaf 7))) 9)
+            (set (minimum y) 4) (check (= (minimum y) 4))
+            (fail (set (label x) 8)) (check (= (label x) 7))
+            (Seen (Pair (Leaf 3) (Leaf 3))) (Seen y)
+            (union x (Leaf 9)) (let z (Pair x (Leaf 7)))
+            (check (= y z)) (check (Seen z))
+            (fail (Seen (absent))) (let after (Leaf 4)) (Seen after)
+            (push) (let nested (Leaf 12)) (Seen nested) (pop)";
+        for threads in [1, 4] {
+            let mut direct = EGraph::new(threads);
+            let mut compiled = EGraph::new(threads);
+            direct.parse_and_run_program(None, text).unwrap();
+            for command in compiled.parse_program(None, text).unwrap() {
+                let resolved = compiled.resolve_command(command).unwrap();
+                for command in resolved.desugared {
+                    if let ResolvedNCommand::CoreAction(action) = command {
+                        compiled.eval_actions_compiled(&ResolvedActions::singleton(action)).unwrap();
+                    } else {
+                        compiled.run_command(command).unwrap();
+                    }
+                }
+            }
+            // Compare the retained rows and their equality classes, including
+            // nested repeated constructors, globals, unions and stack restore.
+            assert_eq!(
+                format!("{:?}", direct.serialize(SerializeConfig::default()).egraph),
+                format!("{:?}", compiled.serialize(SerializeConfig::default()).egraph),
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct InnerProduct {

@@ -4,6 +4,7 @@
 //! implementation here is optimized to execute on a batch of rows at a time.
 use std::{
     any::Any,
+    collections::BTreeMap,
     ops::Deref,
     sync::{
         Arc,
@@ -386,14 +387,18 @@ pub struct ExecutionState<'a> {
 /// tracks if a table has been modified.
 struct MutationBuffers<'a> {
     notify_list: &'a NotificationList<TableId>,
-    buffers: DenseIdMap<TableId, Box<dyn MutationBuffer>>,
+    // One action usually writes only a few tables. Global let bindings can
+    // give those tables very large ids; a dense map would initialize and drop
+    // thousands of empty slots on every action. Keep table-id iteration/drop
+    // order while storing only the buffers this execution actually uses.
+    buffers: BTreeMap<TableId, Box<dyn MutationBuffer>>,
 }
 
 impl Clone for MutationBuffers<'_> {
     fn clone(&self) -> Self {
         let mut res = MutationBuffers::new(self.notify_list, Default::default());
         for (id, buf) in self.buffers.iter() {
-            res.buffers.insert(id, buf.fresh_handle());
+            res.buffers.insert(*id, buf.fresh_handle());
         }
         res
     }
@@ -406,19 +411,19 @@ impl<'a> MutationBuffers<'a> {
     ) -> MutationBuffers<'a> {
         MutationBuffers {
             notify_list,
-            buffers,
+            buffers: buffers.into_iter().collect(),
         }
     }
     fn lazy_init(&mut self, table_id: TableId, f: impl FnOnce() -> Box<dyn MutationBuffer>) {
-        self.buffers.get_or_insert(table_id, f);
+        self.buffers.entry(table_id).or_insert_with(f);
     }
     fn stage_insert(&mut self, table_id: TableId, row: &[Value]) {
-        self.buffers[table_id].stage_insert(row);
+        self.buffers.get_mut(&table_id).unwrap().stage_insert(row);
         self.notify_list.notify(table_id);
     }
 
     fn stage_remove(&mut self, table_id: TableId, key: &[Value]) {
-        self.buffers[table_id].stage_remove(key);
+        self.buffers.get_mut(&table_id).unwrap().stage_remove(key);
         self.notify_list.notify(table_id);
     }
 }

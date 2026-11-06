@@ -60,6 +60,13 @@ impl SortedWritesTable {
             // Incremental rebuilds are possible if we can scan the subset of the columns that are
             // relevant.
             let to_scan = self.subset_tracker.recent_updates(table_id, table);
+            // No representative changed since this table's previous rebuild.
+            // Refreshing the reverse index here cannot produce a candidate;
+            // defer that work until a nonempty delta needs the index. Its own
+            // version tracker still includes all intervening row changes.
+            if to_scan.size() == 0 {
+                return false;
+            }
             if incremental_rebuild(
                 to_scan.size(),
                 self.data.next_row().index(),

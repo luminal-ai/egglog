@@ -6,6 +6,76 @@ use crate::{
 use super::mask::{Mask, MaskIter};
 
 #[test]
+fn sparse_mutation_buffers_keep_notifications_and_flush_order() {
+    use super::{MutationBuffers, TableId, Value};
+    use crate::numeric_id::NumericId;
+    use crate::table_spec::MutationBuffer;
+    use std::sync::{Arc, Mutex};
+
+    type Flushed = Arc<Mutex<Vec<(u32, Vec<(&'static str, Vec<Value>)>)>>>;
+    struct Recording {
+        id: u32,
+        pending: Vec<(&'static str, Vec<Value>)>,
+        flushed: Flushed,
+    }
+    impl MutationBuffer for Recording {
+        fn stage_insert(&mut self, row: &[Value]) {
+            self.pending.push(("insert", row.to_vec()));
+        }
+        fn stage_remove(&mut self, row: &[Value]) {
+            self.pending.push(("remove", row.to_vec()));
+        }
+        fn fresh_handle(&self) -> Box<dyn MutationBuffer> {
+            Box::new(Self {
+                id: self.id,
+                pending: Vec::new(),
+                flushed: self.flushed.clone(),
+            })
+        }
+    }
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            self.flushed
+                .lock()
+                .unwrap()
+                .push((self.id, std::mem::take(&mut self.pending)));
+        }
+    }
+    let notifications = Default::default();
+    let flushed = Flushed::default();
+    let mut buffers = MutationBuffers::new(&notifications, Default::default());
+    let low = TableId::new(3);
+    let high = TableId::new(65_535);
+    for id in [high, low] {
+        buffers.lazy_init(id, || {
+            Box::new(Recording {
+                id: if id == high { 65_535 } else { 3 },
+                pending: Vec::new(),
+                flushed: flushed.clone(),
+            })
+        });
+    }
+    buffers.lazy_init(high, || panic!("existing buffer was replaced"));
+    buffers.stage_insert(high, &[Value::new(11)]);
+    buffers.stage_remove(low, &[Value::new(7)]);
+    assert_eq!(notifications.reset().as_slice(), &[high, low]);
+    let mut cloned = buffers.clone();
+    cloned.stage_insert(high, &[Value::new(13)]);
+    assert_eq!(notifications.reset().as_slice(), &[high]);
+    drop(cloned);
+    drop(buffers);
+    assert_eq!(
+        *flushed.lock().unwrap(),
+        vec![
+            (3, vec![]),
+            (65_535, vec![("insert", vec![Value::new(13)])]),
+            (3, vec![("remove", vec![Value::new(7)])]),
+            (65_535, vec![("insert", vec![Value::new(11)])]),
+        ]
+    );
+}
+
+#[test]
 fn mask_iter() {
     let ps = PoolSet::default();
     let offs = Vec::from_iter(0..100);

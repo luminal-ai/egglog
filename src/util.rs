@@ -63,8 +63,9 @@ impl FreshGen<str, String> for SymbolGen {
         let count_before = *entry;
         *entry += 1;
         format!(
-            "{}{}{}",
+            "{}{}:{}:{}",
             self.reserved_string,
+            name_hint.len(),
             name_hint,
             if self.leave_off_zero && count_before == 0 {
                 "".to_string()
@@ -89,10 +90,12 @@ impl FreshGen<ResolvedCall, ResolvedVar> for SymbolGen {
             .or_insert(0);
         let count = *entry;
         *entry += 1;
+        let hint = name_hint.to_string();
         let name = format!(
-            "{}{}{}",
+            "{}{}:{}:{}",
             self.reserved_string,
-            name_hint,
+            hint.len(),
+            hint,
             if self.leave_off_zero && count == 0 {
                 "".to_string()
             } else {
@@ -109,6 +112,21 @@ impl FreshGen<ResolvedCall, ResolvedVar> for SymbolGen {
             // fresh variables are never global references, since globals
             // are desugared away by `remove_globals`
             is_global_ref: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod symbol_collision_tests {
+    use super::*;
+    #[test]
+    fn numbered_hints_and_generated_suffixes_are_distinct() {
+        let mut generator = SymbolGen::new("__internal_".into());
+        let mut names = HashSet::default();
+        for _ in 0..24 {
+            for hint in ["v1", "v11", "v111", "v1:1", "v", ""] {
+                assert!(names.insert(generator.fresh(hint)));
+            }
         }
     }
 }

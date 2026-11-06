@@ -1,6 +1,6 @@
 //! APIs for building a query of a database.
 
-use std::{iter::once, sync::Arc};
+use std::{cell::RefCell, iter::once, sync::Arc};
 
 use crate::{
     free_join::plan::{DecomposedPlan, JoinStageBlocks, SinglePlan},
@@ -36,7 +36,7 @@ pub struct SymbolMap {
 pub struct CachedPlan {
     plan: Plan,
     desc: Arc<str>,
-    symbol_map: SymbolMap,
+    symbol_map: Arc<SymbolMap>,
     actions: ActionInfo,
 }
 
@@ -58,7 +58,7 @@ pub struct RuleSet {
     /// accounting logic assumes that rules and actions stand in a bijection. If we relaxed that
     /// later on, most of the core logic would still work but the accounting logic could get more
     /// complex.
-    pub(crate) plans: IdVec<RuleId, (Plan, Arc<str> /* description */, SymbolMap)>,
+    pub(crate) plans: IdVec<RuleId, (Plan, Arc<str> /* description */, Arc<SymbolMap>)>,
     pub(crate) actions: DenseIdMap<ActionId, ActionInfo>,
 }
 
@@ -94,6 +94,11 @@ impl RuleSet {
 pub struct RuleSetBuilder<'outer> {
     rule_set: RuleSet,
     db: &'outer mut Database,
+    // This builder holds the database exclusively and does not execute writes.
+    // Seminaive variants repeatedly ask for the same frozen timestamp/literal
+    // subsets. Reuse their contents until this builder is consumed, then make
+    // a fresh cache after the next execution/rebuild.
+    headers: RefCell<HashMap<(TableId, SmallVec<[Constraint; 2]>), Option<JoinHeader>>>,
 }
 
 impl<'outer> RuleSetBuilder<'outer> {
@@ -101,6 +106,7 @@ impl<'outer> RuleSetBuilder<'outer> {
         Self {
             rule_set: Default::default(),
             db,
+            headers: Default::default(),
         }
     }
 
@@ -136,20 +142,26 @@ impl<'outer> RuleSetBuilder<'outer> {
         atom: AtomId,
         constraints: &[Constraint],
     ) -> Option<JoinHeader> {
-        let processed = self.db.process_constraints(table, constraints);
-        if !processed.slow.is_empty() {
-            panic!(
-                "Cached plans only support constraints with a fast pushdown. \
-                 Got: {constraints:?} for table {table:?}",
-            );
-        }
-        if processed.subset.size() == 0 {
-            return None;
-        }
-        Some(JoinHeader {
-            atom,
-            constraints: processed.fast,
-            subset: processed.subset,
+        let key = (table, constraints.iter().cloned().collect());
+        let mut headers = self.headers.borrow_mut();
+        let cached = headers.entry(key).or_insert_with(|| {
+            let processed = self.db.process_constraints(table, constraints);
+            if !processed.slow.is_empty() {
+                panic!(
+                    "Cached plans only support constraints with a fast pushdown. \
+                     Got: {constraints:?} for table {table:?}",
+                );
+            }
+            (processed.subset.size() != 0).then(|| JoinHeader {
+                atom,
+                constraints: processed.fast,
+                subset: Arc::new(processed.subset),
+            })
+        });
+        cached.as_ref().map(|header| {
+            let mut header = header.clone();
+            header.atom = atom;
+            header
         })
     }
 
@@ -572,7 +584,7 @@ impl RuleBuilder<'_, '_> {
             .rsb
             .rule_set
             .plans
-            .push((plan, desc.into(), symbol_map))
+            .push((plan, desc.into(), Arc::new(symbol_map)))
     }
 
     /// Return a variable containing the result of reading the specified counter.

@@ -24,6 +24,12 @@ impl Names {
     }
 
     fn check_pattern_name(&mut self, name: &str, span: &Span) -> Result<(), Error> {
+        self.check_pattern_conflict(name, span)?;
+        self.seen.insert(name.to_owned(), span.clone());
+        Ok(())
+    }
+
+    fn check_pattern_conflict(&self, name: &str, span: &Span) -> Result<(), Error> {
         let canonical = name
             .strip_prefix(GLOBAL_NAME_PREFIX)
             .unwrap_or(name)
@@ -35,7 +41,19 @@ impl Names {
                 span.clone(),
             ));
         }
-        self.check(name.to_owned(), span.clone())
+        if let Some(old) = self.seen.get(name) {
+            return Err(Error::Shadowing(name.to_owned(), old.clone(), span.clone()));
+        }
+        Ok(())
+    }
+
+    fn check_local_name(&self, locals: &mut HashMap<String, Span>, name: &str, span: &Span) -> Result<(), Error> {
+        self.check_pattern_conflict(name, span)?;
+        if let Some(old) = locals.get(name) {
+            return Err(Error::Shadowing(name.to_owned(), old.clone(), span.clone()));
+        }
+        locals.insert(name.to_owned(), span.clone());
+        Ok(())
     }
 
     /// WARNING: this function does not handle `push` and `pop`.
@@ -58,17 +76,21 @@ impl Names {
                 self.check(name.clone(), span.clone())
             }
             ResolvedNCommand::NormRule { rule, .. } => {
-                let mut inner = self.clone();
-                inner.check_shadowing_query(&rule.body)?;
+                // A query/head introduces only a small local scope. Borrow
+                // global names instead of cloning the entire model's symbol
+                // table for every rule and every boundary check.
+                let mut locals = HashMap::default();
+                self.check_shadowing_query(&rule.body, &mut locals)?;
                 for action in rule.head.iter() {
-                    inner.check_shadowing_action(action)?;
+                    if let ResolvedAction::Let(span, name, _) = action {
+                        self.check_local_name(&mut locals, &name.name, span)?;
+                    }
                 }
                 Ok(())
             }
             ResolvedNCommand::CoreAction(action) => self.check_shadowing_action(action),
             ResolvedNCommand::Check(_span, query) => {
-                let mut inner = self.clone();
-                inner.check_shadowing_query(query)
+                self.check_shadowing_query(query, &mut HashMap::default())
             }
             ResolvedNCommand::Fail(_span, command) => {
                 let mut inner = self.clone();
@@ -88,7 +110,7 @@ impl Names {
         }
     }
 
-    fn check_shadowing_query(&mut self, query: &[ResolvedFact]) -> Result<(), Error> {
+    fn check_shadowing_query(&self, query: &[ResolvedFact], locals: &mut HashMap<String, Span>) -> Result<(), Error> {
         // we want to allow names in queries to shadow each other, so we first collect
         // all of the variable names, and then we check each of those names once
         fn collect_expr_names(expr: &ResolvedExpr, out: &mut HashMap<String, Span>) {
@@ -116,7 +138,7 @@ impl Names {
         }
 
         for (name, span) in collected {
-            self.check_pattern_name(&name, &span)?;
+            self.check_local_name(locals, &name, &span)?;
         }
 
         Ok(())

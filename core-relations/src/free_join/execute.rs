@@ -1,11 +1,12 @@
 //! Core free join execution.
 
 use std::{
-    cmp, iter, mem,
+    cmp, mem,
+    collections::BTreeMap,
     ops::Range,
     sync::{
         Arc, OnceLock, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -52,10 +53,10 @@ use super::{
 const SMALL_RESIDUAL: usize = 8;
 
 struct SparseColumnIndex {
-    n_keys: usize,
-    n_subsets: usize,
+    n_keys: u8,
+    n_subsets: u8,
     keys: [Value; SMALL_RESIDUAL],
-    offsets: [usize; SMALL_RESIDUAL],
+    offsets: [u8; SMALL_RESIDUAL],
     subset_ids: [RowId; SMALL_RESIDUAL],
 }
 
@@ -79,20 +80,21 @@ unsafe fn sparse_subset_ref(ids: &[RowId], range: Range<usize>) -> SubsetRef<'_>
 
 impl SparseColumnIndex {
     fn keys(&self) -> &[Value] {
-        &self.keys[..self.n_keys]
+        &self.keys[..usize::from(self.n_keys)]
     }
 
     fn get_offset_for(&self, i: usize) -> Range<usize> {
         let lo = self.offsets[i];
-        let hi = if i + 1 < self.n_keys {
+        let hi = if i + 1 < usize::from(self.n_keys) {
             self.offsets[i + 1]
         } else {
             self.n_subsets
         };
-        lo..hi
+        usize::from(lo)..usize::from(hi)
     }
 
     fn new(table: WrappedTableRef<'_>, subset: SubsetRef<'_>, col: ColumnId) -> Self {
+        const { assert!(SMALL_RESIDUAL <= u8::MAX as usize); }
         let mut rows = [(Value::new_const(0), RowId::new_const(0)); SMALL_RESIDUAL];
         let mut pos = 0;
         table.for_each_col(subset, col, &mut |row_id, val| {
@@ -112,7 +114,7 @@ impl SparseColumnIndex {
         for (i, &(key, row_id)) in rows[..n_subsets].iter().enumerate() {
             let is_new_key = n_keys == 0 || keys[n_keys - 1] != key;
             if is_new_key {
-                offsets[n_keys] = i;
+                offsets[n_keys] = i as u8;
                 keys[n_keys] = key;
                 n_keys += 1;
             }
@@ -120,8 +122,8 @@ impl SparseColumnIndex {
         }
 
         SparseColumnIndex {
-            n_keys,
-            n_subsets,
+            n_keys: n_keys as u8,
+            n_subsets: n_subsets as u8,
             keys,
             offsets,
             subset_ids,
@@ -144,7 +146,7 @@ impl SparseColumnIndex {
         if self.n_keys == 0 {
             return;
         }
-        for i in 0..self.n_keys {
+        for i in 0..usize::from(self.n_keys) {
             let range = self.get_offset_for(i);
             // SAFETY: see `get_subset` — each per-key range of `subset_ids` is sorted.
             let subset = unsafe { sparse_subset_ref(&self.subset_ids, range) };
@@ -153,7 +155,7 @@ impl SparseColumnIndex {
     }
 
     fn len(&self) -> usize {
-        self.n_keys
+        usize::from(self.n_keys)
     }
 }
 
@@ -245,7 +247,7 @@ impl SortedColumnIndex {
     }
 }
 
-enum DynamicIndex {
+enum DynamicIndex<'a> {
     Cached {
         /// When Some(range), intersect each subset from the index with this dense range.
         /// The range is the Dense outer subset known at Prober construction time.
@@ -256,10 +258,13 @@ enum DynamicIndex {
         /// When Some(range), intersect each subset from the index with this dense range.
         /// The range is the Dense outer subset known at Prober construction time.
         intersect_outer: Option<OffsetRange>,
-        table: HashColumnIndex,
+        table: &'a HashColumnIndex,
     },
     Dynamic(TupleIndex),
-    DynamicColumn(Arc<SortedColumnIndex>),
+    // The prober owns its TrieNode, which owns this immutable index. Keep
+    // the column rather than cloning an Arc on every probe: parallel plans
+    // otherwise contend on one reference-count cache line millions of times.
+    DynamicColumn(ColumnId),
     SparseColumn(SparseColumnIndex),
 }
 
@@ -324,12 +329,12 @@ fn intersect_with_dense_ref<'a>(v: SubsetRef<'a>, range: OffsetRange) -> Option<
     }
 }
 
-struct Prober {
+struct Prober<'a> {
     node: Arc<TrieNode>,
-    ix: DynamicIndex,
+    ix: DynamicIndex<'a>,
 }
 
-impl Prober {
+impl Prober<'_> {
     fn get_subset<'a>(&'a self, key: &'a [Value]) -> Option<PotentiallyStale<SubsetRef<'a>>> {
         match &self.ix {
             DynamicIndex::Cached {
@@ -358,8 +363,8 @@ impl Prober {
                 Some(PotentiallyStale::maybe_stale(subset))
             }
             DynamicIndex::Dynamic(tab) => tab.get_subset(key).map(PotentiallyStale::not_stale),
-            DynamicIndex::DynamicColumn(tab) => {
-                tab.get_subset(key[0]).map(PotentiallyStale::not_stale)
+            DynamicIndex::DynamicColumn(col) => {
+                self.node.cached_index(*col).get_subset(key[0]).map(PotentiallyStale::not_stale)
             }
             DynamicIndex::SparseColumn(tab) => {
                 debug_assert_eq!(key.len(), 1);
@@ -410,7 +415,7 @@ impl Prober {
             DynamicIndex::Dynamic(tab) => {
                 tab.for_each(|k, v| f(k, PotentiallyStale::not_stale(v)));
             }
-            DynamicIndex::DynamicColumn(tab) => tab.for_each(|k, v| {
+            DynamicIndex::DynamicColumn(col) => self.node.cached_index(*col).for_each(|k, v| {
                 f(&[k], PotentiallyStale::not_stale(v));
             }),
             DynamicIndex::SparseColumn(tab) => {
@@ -424,7 +429,7 @@ impl Prober {
             DynamicIndex::Cached { table, .. } => table.get().unwrap().len(),
             DynamicIndex::CachedColumn { table, .. } => table.get().unwrap().len(),
             DynamicIndex::Dynamic(tab) => tab.len(),
-            DynamicIndex::DynamicColumn(tab) => tab.len(),
+            DynamicIndex::DynamicColumn(col) => self.node.cached_index(*col).len(),
             DynamicIndex::SparseColumn(tab) => tab.len(),
         }
     }
@@ -445,6 +450,9 @@ impl Database {
             return RuleSetReport::default();
         }
         let match_counter = Arc::new(MatchCounter::new(rule_set.actions.n_ids()));
+        let query_task_times = std::env::var_os("EGGLOG_PROFILE_QUERY_TASKS").map(|_| {
+            (0..rule_set.actions.n_ids()).map(|_| AtomicU64::new(0)).collect::<Vec<_>>()
+        });
         // Trie roots are shared across all plans in this run. Tables are frozen
         // for the duration, so a given root key always denotes the same subset;
         // the cache is scoped to (and dropped at the end of) this call. Only
@@ -472,6 +480,22 @@ impl Database {
         // let mut rule_reports: HashMap<String, Vec<RuleReport>>;
         let mut rule_reports: HashMap<Arc<str>, Vec<RuleReport>>;
         let exec_state = ExecutionState::new(self.read_only_view_with(context), Default::default());
+        // Tables are frozen for this entire rule-set execution. Keep one
+        // owning reference per table/column and lend it to short-lived probes;
+        // cloning the global index Arc for every join contends on its refcount
+        // across all workers. The next execution creates a new cache and
+        // refreshes indexes after any intervening writes/rebuilds.
+        // Facts are also executed as tiny rule sets. Visiting every table for
+        // each fact makes loading a large graph quadratic in table count.
+        // Table ids may include many retired temporary tables, so keep this
+        // sparse and proportional to the tables referenced by these plans.
+        let mut column_prober_storage = HashMap::default();
+        for (plan, _, _) in rule_set.plans.values() {
+            for (_, atom) in plan.atoms().iter() {
+                column_prober_storage.entry(atom.table).or_insert_with(OnceLock::new);
+            }
+        }
+        let column_probers = &column_prober_storage;
         if parallelize_db_level_op(self.total_size_estimate) {
             let dash_rule_reports: Arc<DashMap<Arc<str>, Vec<RuleReport>>> =
                 Arc::new(DashMap::default());
@@ -491,12 +515,14 @@ impl Database {
                     let exec_state = exec_state.clone();
                     let match_counter = match_counter.clone();
                     let trie_cache = trie_cache.clone();
+                    let task_time = query_task_times.as_ref().map(|times| &times[plan.actions().index()]);
                     scope.spawn(move |rule_scope| {
-                        let join_state = JoinState::new(db, exec_state.clone(), trie_cache);
+                        let join_state = JoinState::new(db, exec_state.clone(), trie_cache, column_probers);
                         let mut binding_info = BindingInfo::default();
                         let mut action_buf =
-                            ScopedActionBuffer::new(rule_scope, rule_set, match_counter.clone());
+                            ScopedActionBuffer::new(rule_scope, rule_set, match_counter.clone(), task_time);
                         let search_and_apply_timer = Instant::now();
+                        log::trace!(target: "egglog::query", "BEGIN query {desc}");
 
                         'eval: {
                             for (id, info) in plan.atoms().iter() {
@@ -589,8 +615,12 @@ impl Database {
                             }
                         }
                         let search_and_apply_time = search_and_apply_timer.elapsed();
+                        log::trace!(target: "egglog::query", "END query seconds={} {desc}", search_and_apply_time.as_secs_f64());
                         if action_buf.needs_flush {
                             action_buf.flush(&mut exec_state.clone());
+                        }
+                        if let Some(time) = task_time {
+                            time.fetch_add(search_and_apply_timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                         let mut rule_report: RefMut<'_, Arc<str>, Vec<RuleReport>> =
                             dash_rule_reports.entry(desc).or_default();
@@ -606,9 +636,19 @@ impl Database {
                 .iter()
                 .map(|entry| (entry.key().clone(), entry.value().clone()))
                 .collect();
+            if let Some(times) = &query_task_times {
+                let mut costs = rule_set.plans.values().map(|(plan, desc, _)| {
+                    (times[plan.actions().index()].load(Ordering::Relaxed), desc)
+                }).collect::<Vec<_>>();
+                costs.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
+                for (ns, desc) in costs.into_iter().take(12).filter(|(ns, _)| *ns >= 100_000_000) {
+                    eprintln!("QUERY_TASK_CPU seconds={:.6} {desc}", ns as f64 / 1e9);
+                }
+            }
         } else {
             rule_reports = HashMap::default();
-            let join_state = JoinState::new(self, exec_state.clone(), trie_cache.clone());
+            let join_state =
+                JoinState::new(self, exec_state.clone(), trie_cache.clone(), column_probers);
             // Just run all of the plans in order with a single in-place action
             // buffer.
             let mut action_buf = InPlaceActionBuffer {
@@ -626,6 +666,7 @@ impl Database {
                 let mut binding_info = BindingInfo::default();
 
                 let search_and_apply_timer = Instant::now();
+                log::trace!(target: "egglog::query", "BEGIN query {desc}");
                 'eval: {
                     for (id, info) in plan.atoms().iter() {
                         let headers: SmallVec<[&JoinHeader; 2]> =
@@ -692,6 +733,7 @@ impl Database {
                     }
                 }
                 let search_and_apply_time = search_and_apply_timer.elapsed();
+                log::trace!(target: "egglog::query", "END query seconds={} {desc}", search_and_apply_time.as_secs_f64());
 
                 // TODO: unnecessary cloning in many cases
                 let rule_report = rule_reports.entry(desc.clone()).or_default();
@@ -720,6 +762,9 @@ impl Database {
         }
         let search_and_apply_time = search_and_apply_timer.elapsed();
 
+        // Resetting changed indexes requires unique Arc ownership in TableInfo.
+        // All scoped probes have finished before we release these references.
+        drop(column_prober_storage);
         let merge_timer = Instant::now();
         let changed = self.merge_all();
         let merge_time = merge_timer.elapsed();
@@ -758,10 +803,11 @@ struct JoinState<'a> {
     /// Cross-plan trie-root cache for the current `run_rule_set`, or `None` when
     /// sharing is disabled (small run, or nothing reused across plans).
     trie_cache: Option<Arc<TrieCache>>,
+    column_probers: &'a HashMap<TableId, OnceLock<Vec<OnceLock<HashColumnIndex>>>>,
 }
 
 /// Per-column indexes on a trie node's subset, lazily initialized on first access per column.
-type ColumnIndexes = IdVec<ColumnId, OnceLock<Arc<SortedColumnIndex>>>;
+type ColumnIndexes = IdVec<ColumnId, OnceLock<SortedColumnIndex>>;
 // Each TrieNode is probed with exactly one column in practice, so we store a single
 // (ColumnId, map) pair instead of a per-column IdVec of Mutexes.
 //
@@ -918,7 +964,7 @@ impl TrieNode {
     fn size(&self) -> usize {
         self.subset.size()
     }
-    fn get_cached_index(&self, col: ColumnId, info: &TableInfo) -> Arc<SortedColumnIndex> {
+    fn get_cached_index(&self, col: ColumnId, info: &TableInfo) -> &SortedColumnIndex {
         self.cached_subsets.get_or_init(|| {
             // Pre-size the vector so we do not need to borrow it mutably to initialize the index.
             let mut vec: Pooled<ColumnIndexes> = with_pool_set(|ps| ps.get());
@@ -926,13 +972,17 @@ impl TrieNode {
             vec
         })[col]
             .get_or_init(|| {
-                Arc::new(SortedColumnIndex::build_for_subset(
+                SortedColumnIndex::build_for_subset(
                     info.table.as_ref(),
                     self.subset.as_ref(),
                     col,
-                ))
+                )
             })
-            .clone()
+    }
+
+    fn cached_index(&self, col: ColumnId) -> &SortedColumnIndex {
+        self.cached_subsets.get().expect("prober initialized its column index")[col]
+            .get().expect("prober initialized its column index")
     }
 
     /// Return the child node reached by additionally constraining `col = value`
@@ -1044,12 +1094,14 @@ impl<'a> JoinState<'a> {
         db: &'a Database,
         exec_state: ExecutionState<'a>,
         trie_cache: Option<Arc<TrieCache>>,
+        column_probers: &'a HashMap<TableId, OnceLock<Vec<OnceLock<HashColumnIndex>>>>,
     ) -> Self {
         Self {
             db,
             exec_state,
             pool: with_pool_set(|ps| ps.get_pool()),
             trie_cache,
+            column_probers,
         }
     }
 
@@ -1114,7 +1166,7 @@ impl<'a> JoinState<'a> {
             if h.subset.is_empty() {
                 return None;
             }
-            subset.intersect(h.subset.as_ref(), &self.pool);
+            subset.intersect(h.subset.as_ref().as_ref(), &self.pool);
             if subset.is_empty() {
                 return None;
             }
@@ -1127,9 +1179,8 @@ impl<'a> JoinState<'a> {
         atoms: &Arc<DenseIdMap<AtomId, Atom>>,
         atom: AtomId,
         binding_info: &mut BindingInfo,
-        cols: impl Iterator<Item = ColumnId>,
-    ) -> Prober {
-        let cols = SmallVec::<[ColumnId; 4]>::from_iter(cols);
+        cols: &[ColumnId],
+    ) -> Prober<'_> {
         let trie_node = binding_info.subsets.unwrap_val(atom);
         let subset = &trie_node.subset;
 
@@ -1168,19 +1219,23 @@ impl<'a> JoinState<'a> {
                 if cols.len() != 1 {
                     DynamicIndex::Cached {
                         intersect_outer,
-                        table: get_index_from_tableinfo(info, &cols),
+                        table: get_index_from_tableinfo(info, cols),
                     }
                 } else {
                     DynamicIndex::CachedColumn {
                         intersect_outer,
-                        table: get_column_index_from_tableinfo(info, cols[0]).clone(),
+                        table: self.column_probers[&table_id].get_or_init(|| {
+                            (0..info.spec.arity()).map(|_| OnceLock::new()).collect()
+                        })[cols[0].index()]
+                        .get_or_init(|| get_column_index_from_tableinfo(info, cols[0])),
                     }
                 }
             } else if cols.len() != 1 {
                 // NB: we should have a caching strategy for non-column indexes.
-                DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
+                DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), cols))
             } else {
-                DynamicIndex::DynamicColumn(trie_node.get_cached_index(cols[0], info))
+                trie_node.get_cached_index(cols[0], info);
+                DynamicIndex::DynamicColumn(cols[0])
             }
         };
         Prober {
@@ -1194,8 +1249,8 @@ impl<'a> JoinState<'a> {
         binding_info: &mut BindingInfo,
         atom: AtomId,
         col: ColumnId,
-    ) -> Prober {
-        self.get_index(atoms, atom, binding_info, iter::once(col))
+    ) -> Prober<'_> {
+        self.get_index(atoms, atom, binding_info, &[col])
     }
 
     /// Runs the free join plan, starting with the header.
@@ -1343,6 +1398,7 @@ impl<'a> JoinState<'a> {
                 let exec_state_for_factory = self.exec_state.clone();
                 let exec_state_for_work = self.exec_state.clone();
                 let trie_cache = self.trie_cache.clone();
+                let column_probers = self.column_probers;
                 action_buf.recur(
                     BorrowedLocalState {
                         binding_info,
@@ -1377,6 +1433,7 @@ impl<'a> JoinState<'a> {
                                     // than drain_updates eevn when both are run in single thread
                                     pool: with_pool_set(|ps| ps.get_pool()),
                                     trie_cache: trie_cache.clone(),
+                                    column_probers,
                                 }
                                 .run_plan(
                                     stages,
@@ -1792,7 +1849,7 @@ impl<'a> JoinState<'a> {
                                 atoms,
                                 spec.to_index.atom,
                                 binding_info,
-                                spec.to_index.vars.iter().copied(),
+                                &spec.to_index.vars,
                             ),
                         )
                     })
@@ -1977,7 +2034,7 @@ impl<'a> JoinState<'a> {
                             atoms,
                             spec.to_index.atom,
                             binding_info,
-                            spec.to_index.vars.iter().copied(),
+                            &spec.to_index.vars,
                         )
                     })
                     .collect::<SmallVec<[Prober; 4]>>();
@@ -2205,7 +2262,7 @@ trait ActionBuffer<'state, A: NumericId>: Send {
 struct InPlaceActionBuffer<'a> {
     rule_set: &'a RuleSet,
     match_counter: &'a MatchCounter,
-    batches: DenseIdMap<ActionId, ActionState>,
+    batches: BTreeMap<ActionId, ActionState>,
 }
 
 impl<'a, 'outer: 'a> ActionBuffer<'a, ActionId> for InPlaceActionBuffer<'outer> {
@@ -2222,7 +2279,8 @@ impl<'a, 'outer: 'a> ActionBuffer<'a, ActionId> for InPlaceActionBuffer<'outer> 
     ) {
         let action_state = self
             .batches
-            .get_or_insert(action, || ActionState::new(LOCAL_ACTION_BATCH_SIZE));
+            .entry(action)
+            .or_insert_with(|| ActionState::new(LOCAL_ACTION_BATCH_SIZE));
         action_state.n_runs += 1;
         action_state.len += 1;
         let action_info = &self.rule_set.actions[action];
@@ -2268,8 +2326,15 @@ struct ScopedActionBuffer<'inner, 'scope> {
     scope: &'inner Scope<'scope>,
     rule_set: &'scope RuleSet,
     match_counter: Arc<MatchCounter>,
-    batches: DenseIdMap<ActionId, ActionState>,
+    // A scoped query normally executes one action, whose ID belongs to the
+    // entire ruleset. A dense map initializes/drops every lower ID for each
+    // query and recursively forked batch. Store only the actions used here,
+    // retaining ascending-ID flush order like the serial evaluator.
+    batches: BTreeMap<ActionId, ActionState>,
     needs_flush: bool,
+    // Optional task CPU-time diagnostic. A rule's parent query can return
+    // before its forked joins/actions finish, so its ordinary timer omits them.
+    task_time: Option<&'scope AtomicU64>,
 }
 
 impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
@@ -2277,6 +2342,7 @@ impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
         scope: &'inner Scope<'scope>,
         rule_set: &'scope RuleSet,
         match_counter: Arc<MatchCounter>,
+        task_time: Option<&'scope AtomicU64>,
     ) -> Self {
         Self {
             scope,
@@ -2284,6 +2350,7 @@ impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
             batches: Default::default(),
             match_counter,
             needs_flush: false,
+            task_time,
         }
     }
 }
@@ -2303,7 +2370,8 @@ impl<'scope> ActionBuffer<'scope, ActionId> for ScopedActionBuffer<'_, 'scope> {
         let batch_size = action_batch_size();
         let action_state = self
             .batches
-            .get_or_insert(action, || ActionState::new(batch_size));
+            .entry(action)
+            .or_insert_with(|| ActionState::new(batch_size));
         action_state.n_runs += 1;
         action_state.len += 1;
         let action_info = &self.rule_set.actions[action];
@@ -2317,9 +2385,14 @@ impl<'scope> ActionBuffer<'scope, ActionId> for ScopedActionBuffer<'_, 'scope> {
             let mut bindings = mem::replace(&mut action_state.bindings, Bindings::new(batch_size));
             action_state.len = 0;
             let match_counter = self.match_counter.clone();
+            let task_time = self.task_time;
             self.scope.spawn(move |_| {
+                let timer = task_time.map(|_| Instant::now());
                 let succeeded = state.run_instrs(&action_info.instrs, &mut bindings);
                 match_counter.inc_matches(action, succeeded);
+                if let (Some(time), Some(timer)) = (task_time, timer) {
+                    time.fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
             });
         }
     }
@@ -2344,13 +2417,16 @@ impl<'scope> ActionBuffer<'scope, ActionId> for ScopedActionBuffer<'_, 'scope> {
         let rule_set = self.rule_set;
         let match_counter = self.match_counter.clone();
         let mut inner = local.clone_state();
+        let task_time = self.task_time;
         self.scope.spawn(move |scope| {
+            let timer = task_time.map(|_| Instant::now());
             let mut buf: ScopedActionBuffer<'_, 'scope> = ScopedActionBuffer {
                 scope,
                 rule_set,
                 match_counter,
                 needs_flush: false,
                 batches: Default::default(),
+                task_time,
             };
             work(inner.borrow_mut(), &mut buf);
             if buf.needs_flush {
@@ -2360,6 +2436,9 @@ impl<'scope> ActionBuffer<'scope, ActionId> for ScopedActionBuffer<'_, 'scope> {
                     buf.rule_set,
                     buf.match_counter.as_ref(),
                 );
+            }
+            if let (Some(time), Some(timer)) = (task_time, timer) {
+                time.fetch_add(timer.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         });
     }
@@ -2419,15 +2498,15 @@ fn expand_binding_sets<'state, A: NumericId, BUF: ActionBuffer<'state, A> + ?Siz
 
 fn flush_action_states(
     exec_state: &mut ExecutionState,
-    actions: &mut DenseIdMap<ActionId, ActionState>,
+    actions: &mut BTreeMap<ActionId, ActionState>,
     rule_set: &RuleSet,
     match_counter: &MatchCounter,
 ) {
     for (action, ActionState { bindings, len, .. }) in actions.iter_mut() {
         if *len > 0 {
-            let succeeded = exec_state.run_instrs(&rule_set.actions[action].instrs, bindings);
+            let succeeded = exec_state.run_instrs(&rule_set.actions[*action].instrs, bindings);
             bindings.clear();
-            match_counter.inc_matches(action, succeeded);
+            match_counter.inc_matches(*action, succeeded);
             *len = 0;
         }
     }
