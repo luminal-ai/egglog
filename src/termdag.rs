@@ -681,7 +681,7 @@ mod tests {
         let mut sym = SymbolGen::new(String::new());
         let repr = td.to_string_with_let_internal(&mut sym, t, &mut buf, |_| "t".to_string());
         let first_line = buf.lines().next().expect("expected let binding");
-        assert!(first_line.starts_with("(let t"));
+        assert!(first_line.starts_with("(let 1:t:"));
         assert!(buf.contains("(h"));
         let has_lonely_paren = buf.lines().any(|line| line.trim() == ")");
         assert!(
@@ -689,7 +689,7 @@ mod tests {
             "unexpected standalone closing paren in\n{buf}"
         );
         assert!(buf.trim_end().ends_with(')'));
-        assert_eq!(repr, "(f t t)");
+        assert_eq!(repr, "(f 1:t: 1:t:)");
     }
 
     #[test]
