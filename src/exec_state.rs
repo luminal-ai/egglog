@@ -395,6 +395,19 @@ pub trait Read<'a, 'db: 'a>: Core<'a, 'db> + RegistrySealed<'a, 'db> {
         func_type_of(self.type_info(), name, FunctionSubtype::Constructor)
     }
 
+    /// Registered constructor signatures without enumerating function tables
+    /// or reading row counts. The borrowed signatures are immutable for this
+    /// execution; later declarations and push/pop use their own type state.
+    fn constructor_schemas(&self) -> Result<Vec<&'db FuncType>, Error> {
+        let info = self.type_info().ok_or_else(|| ApiError::SchemasUnavailable {
+            name: "constructor schemas".to_owned(),
+        })?;
+        Ok(info.constructor_schemas().filter(|schema| {
+            self.registry().lookup_table(&schema.name)
+                .is_some_and(|table| table.kind() == TableKind::Constructor)
+        }).collect())
+    }
+
     /// A function's declared signature: its input sorts and its output sort.
     ///
     /// **Only valid for `function` tables.** Constructors error; use

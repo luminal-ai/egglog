@@ -212,6 +212,9 @@ pub struct TypeInfo {
     pub(crate) sorts: HashMap<String, Arc<dyn Sort>>,
     primitives: HashMap<String, Vec<PrimitiveWithId>>,
     func_types: HashMap<String, Arc<FuncType>>,
+    // Constructor walks must not scan every global/analysis function. Keep
+    // this declaration index in the same cloned typechecking state as schemas.
+    constructor_types: IndexMap<String, Arc<FuncType>>,
     pub(crate) global_sorts: HashMap<String, ArcSort>,
     /// Sorts that do not allow union (e.g., from `:no-union` sorts or relations).
     pub(crate) non_unionable_sorts: HashSet<String>,
@@ -476,12 +479,14 @@ impl EGraph {
                 }
             }
             NCommand::CoreAction(action @ Action::Let(span, var, _)) => {
-                let action = self.type_info.typecheck_standalone_action(
+                let direct = self.proof_state.original_typechecking.is_none()
+                    .then(|| self.type_info.resolve_constructor_fact(action)).flatten();
+                let action = if let Some(direct) = direct { direct } else { self.type_info.typecheck_standalone_action(
                     symbol_gen,
                     action,
                     &Default::default(),
                     Context::Full,
-                )?;
+                )? };
                 self.ensure_global_name_prefix(span, var)?;
                 let ResolvedAction::Let(_, resolved_var, _) = &action else {
                     unreachable!("typechecking an Action::Let should return ResolvedAction::Let")
@@ -492,12 +497,14 @@ impl EGraph {
                 ResolvedNCommand::CoreAction(action)
             }
             NCommand::CoreAction(action) => {
-                ResolvedNCommand::CoreAction(self.type_info.typecheck_standalone_action(
+                let direct = self.proof_state.original_typechecking.is_none()
+                    .then(|| self.type_info.resolve_constructor_fact(action)).flatten();
+                ResolvedNCommand::CoreAction(if let Some(direct) = direct { direct } else { self.type_info.typecheck_standalone_action(
                     symbol_gen,
                     action,
                     &Default::default(),
                     Context::Full,
-                )?)
+                )? })
             }
             NCommand::Extract(span, expr, variants) => {
                 let res_expr = self.type_info.typecheck_standalone_expr(
@@ -784,10 +791,7 @@ impl TypeInfo {
             ));
         }
         let ftype = self.function_to_functype(fdecl)?;
-        if self
-            .func_types
-            .insert(fdecl.name.clone(), Arc::new(ftype))
-            .is_some()
+        if self.declare_func_type(Arc::new(ftype)).is_some()
         {
             return Err(TypeError::FunctionAlreadyBound(
                 fdecl.name.clone(),
@@ -1103,6 +1107,53 @@ impl TypeInfo {
         }
     }
 
+    /// Constructor signatures determine every sort in these ground facts.
+    /// Check them directly instead of constructing and solving a constraint
+    /// problem with temporary variables. Ambiguity, primitives, local names,
+    /// and invalid facts retain the original solver and its diagnostics.
+    fn resolve_constructor_fact(&self, action: &Action) -> Option<ResolvedAction> {
+        fn expr(info: &TypeInfo, value: &Expr) -> Option<ResolvedExpr> {
+            match value {
+                Expr::Lit(span, literal) => Some(ResolvedExpr::Lit(span.clone(), literal.clone())),
+                Expr::Var(span, name) => Some(ResolvedExpr::Var(span.clone(), ResolvedVar {
+                    name: name.clone(), sort: info.global_sorts.get(name)?.clone(), is_global_ref: true,
+                })),
+                Expr::Call(span, name, children) => {
+                    let function = info.get_func_type(name)?;
+                    if function.subtype != FunctionSubtype::Constructor || info.is_primitive(name)
+                        || function.input.len() != children.len() { return None; }
+                    let children = children.iter().map(|child| expr(info, child)).collect::<Option<Vec<_>>>()?;
+                    if !children.iter().zip(&function.input).all(|(child, sort)| child.output_type().name() == sort.name()) {
+                        return None;
+                    }
+                    Some(ResolvedExpr::Call(span.clone(), ResolvedCall::Func(function.clone()), children))
+                }
+            }
+        }
+        match action {
+            Action::Let(span, name, value) if !self.global_sorts.contains_key(name) => {
+                let value = expr(self, value)?;
+                Some(ResolvedAction::Let(span.clone(), ResolvedVar {
+                    name: name.clone(), sort: value.output_type(), is_global_ref: false,
+                }, value))
+            }
+            Action::Expr(span, value) => Some(ResolvedAction::Expr(span.clone(), expr(self, value)?)),
+            Action::Set(span, name, inputs, value) => {
+                let function = self.get_func_type(name)?;
+                if function.subtype != FunctionSubtype::Custom || self.is_primitive(name)
+                    || inputs.len() != function.input.len() { return None; }
+                let inputs = inputs.iter().map(|input| expr(self, input)).collect::<Option<Vec<_>>>()?;
+                let value = expr(self, value)?;
+                if value.output_type().name() != function.output.name()
+                    || !inputs.iter().zip(&function.input).all(|(input, sort)| input.output_type().name() == sort.name()) {
+                    return None;
+                }
+                Some(ResolvedAction::Set(span.clone(), ResolvedCall::Func(function.clone()), inputs, value))
+            }
+            _ => None,
+        }
+    }
+
     fn typecheck_standalone_action(
         &self,
         symbol_gen: &mut SymbolGen,
@@ -1150,8 +1201,17 @@ impl TypeInfo {
     /// Record a signature for a function that did not come through
     /// typechecking — desugaring generates some (global bindings, proof
     /// tables) directly.
-    pub(crate) fn declare_func_type(&mut self, func_type: Arc<FuncType>) {
-        self.func_types.insert(func_type.name.clone(), func_type);
+    pub(crate) fn declare_func_type(&mut self, func_type: Arc<FuncType>) -> Option<Arc<FuncType>> {
+        if func_type.subtype == FunctionSubtype::Constructor {
+            self.constructor_types.insert(func_type.name.clone(), func_type.clone());
+        } else {
+            self.constructor_types.shift_remove(&func_type.name);
+        }
+        self.func_types.insert(func_type.name.clone(), func_type)
+    }
+
+    pub(crate) fn constructor_schemas(&self) -> impl Iterator<Item = &FuncType> {
+        self.constructor_types.values().map(AsRef::as_ref)
     }
 
     pub fn is_constructor(&self, sym: &str) -> bool {
@@ -1271,6 +1331,27 @@ pub enum TypeError {
 #[cfg(test)]
 mod test {
     use crate::{EGraph, Error, typechecking::TypeError};
+
+    #[test]
+    fn constructor_fact_types_match_constraint_solver() {
+        use crate::{ast::Command, util::SymbolGen, Context};
+        let mut graph = EGraph::default();
+        graph.parse_and_run_program(None, "(datatype T (Leaf i64) (Pair T T))
+            (function f (T i64) T :no-merge) (let x (Leaf 3))").unwrap();
+        for text in ["(let y (Pair x (Leaf 4)))", "(let number 7)",
+                     "(Pair (Leaf 1) x)", "(set (f (Leaf 2) 5) (Pair x x))"] {
+            let Command::Action(action) = graph.parse_program(None, text).unwrap().remove(0) else { panic!() };
+            let direct = graph.type_info.resolve_constructor_fact(&action).unwrap();
+            let reference = graph.type_info.typecheck_standalone_action(
+                &mut SymbolGen::new("__fact_test".to_owned()), &action, &Default::default(), Context::Full).unwrap();
+            assert_eq!(format!("{direct:?}"), format!("{reference:?}"));
+        }
+        for text in ["(Leaf true)", "(Pair x)", "(Pair x missing)",
+                     "(set (f x 2) 3)", "(let y (+ 1 2))", "(f x 1)"] {
+            let Command::Action(action) = graph.parse_program(None, text).unwrap().remove(0) else { panic!() };
+            assert!(graph.type_info.resolve_constructor_fact(&action).is_none(), "{text}");
+        }
+    }
 
     #[test]
     fn test_arity_mismatch() {

@@ -439,7 +439,7 @@ pool_set! {
         predicted_vals: PredictedVals [ 1 << 20 ],
         shard_hist: DenseIdMap<ShardId, usize> [ 1 << 20 ],
         instr_indexes: Vec<u32> [ 1 << 20 ],
-        cached_subsets: IdVec<ColumnId, std::sync::OnceLock<std::sync::Arc<SortedColumnIndex>>> [ 4 << 20 ],
+        cached_subsets: IdVec<ColumnId, std::sync::OnceLock<SortedColumnIndex>> [ 4 << 20 ],
         intersected_on: DenseIdMap<AtomId, i64> [ 1 << 20 ],
 
         cached_child: IdVec<ColumnId, std::sync::RwLock<HashMap<Value, (std::sync::Arc<TrieNode>, Box<[Constraint]>)>>> [ 1 << 20 ],

@@ -104,7 +104,7 @@ pub(crate) struct JoinHeader {
     /// Why use the constraints at all? Because we want to use them to
     /// discover common plan nodes from different queries (subsets can be
     /// large).
-    pub subset: Subset,
+    pub subset: Arc<Subset>,
 }
 
 impl std::fmt::Debug for JoinHeader {
@@ -1395,7 +1395,7 @@ fn plan_headers<'a, 'b>(
             header.push(JoinHeader {
                 atom,
                 constraints: Pooled::cloned(&atom_info.constraints.fast),
-                subset: atom_info.constraints.subset.clone(),
+                subset: Arc::new(atom_info.constraints.subset.clone()),
             });
         }
     }

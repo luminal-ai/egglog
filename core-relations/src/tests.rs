@@ -1214,6 +1214,66 @@ fn early_stop() {
     run_serial_and_parallel(early_stop_inner);
 }
 
+#[test]
+fn cached_constraints_rebind_atoms_and_refresh_after_table_changes() {
+    run_serial_and_parallel(|| {
+        let mut db = Database::default();
+        let table = db.add_table(
+            SortedWritesTable::new(1, 2, None, vec![], Box::new(|_, _, _, _| false)),
+            iter::empty(), iter::empty(),
+        );
+        {
+            let mut buffer = db.new_buffer(table);
+            for i in 0..4 { buffer.stage_insert(&[v(i), v(i % 2)]); }
+        }
+        db.merge_all();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let record = db.add_external_function(Box::new(make_external_func(move |_, args| {
+            observed.lock().unwrap().push((args[0], args[1]));
+            Some(v(0))
+        })));
+        let mut builder = db.new_rule_set();
+        let mut query = builder.new_rule();
+        let x = query.new_var();
+        let y = query.new_var();
+        let a = query.new_var();
+        let b = query.new_var();
+        let left = query.add_atom(table, &[x.into(), a.into()], &[]).unwrap();
+        let right = query.add_atom(table, &[y.into(), b.into()], &[]).unwrap();
+        let mut rule = query.build();
+        rule.call_external(record, &[x.into(), y.into()]).unwrap();
+        let id = rule.build_with_description("cached-pairs");
+        let cached = builder.build().build_cached_plan(id);
+        let equal = |value| Constraint::EqConst { col: ColumnId::from_usize(1), val: v(value) };
+        let mut builder = db.new_rule_set();
+        for _ in 0..2 {
+            assert!(builder.add_rule_from_cached_plan(&cached, &[(left, equal(1)), (right, equal(1))]).is_some());
+            assert!(builder.add_rule_from_cached_plan(&cached, &[(left, equal(9))]).is_none());
+        }
+        let ruleset = builder.build();
+        db.run_rule_set(&ruleset, ReportLevel::WithPlan, None);
+        let mut actual = std::mem::take(&mut *seen.lock().unwrap());
+        actual.sort();
+        let mut expected = vec![(v(1),v(1)), (v(1),v(3)), (v(3),v(1)), (v(3),v(3))];
+        expected.extend(expected.clone()); expected.sort();
+        assert_eq!(actual, expected);
+        {
+            let mut buffer = db.new_buffer(table);
+            buffer.stage_remove(&[v(1)]);
+            buffer.stage_insert(&[v(5), v(1)]);
+            buffer.stage_insert(&[v(9), v(9)]);
+        }
+        db.merge_all();
+        let mut builder = db.new_rule_set();
+        assert!(builder.add_rule_from_cached_plan(&cached, &[(left, equal(1)), (right, equal(9))]).is_some());
+        let ruleset = builder.build();
+        db.run_rule_set(&ruleset, ReportLevel::TimeOnly, None);
+        let mut actual = std::mem::take(&mut *seen.lock().unwrap()); actual.sort();
+        assert_eq!(actual, vec![(v(3),v(9)), (v(5),v(9))]);
+    });
+}
+
 fn early_stop_inner() {
     let mut db = Database::default();
 

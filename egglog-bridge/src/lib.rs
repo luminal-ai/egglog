@@ -111,9 +111,21 @@ impl Timestamp {
     }
 }
 
+/// A clone is a distinct database: matching table versions in two branches
+/// must never be accepted as proof that a snapshot is unchanged.
+struct SnapshotIdentity(u64);
+impl Default for SnapshotIdentity {
+    fn default()->Self {
+        static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed))
+    }
+}
+impl Clone for SnapshotIdentity {fn clone(&self)->Self{Self::default()}}
+
 /// The state associated with an egglog program.
 #[derive(Clone)]
 pub struct EGraph {
+    snapshot_identity: SnapshotIdentity,
     db: Database,
     uf_table: TableId,
     id_counter: CounterId,
@@ -234,6 +246,7 @@ impl EGraph {
         )));
 
         Self {
+            snapshot_identity:SnapshotIdentity::default(),
             db,
             uf_table,
             id_counter,
@@ -375,8 +388,10 @@ impl EGraph {
     /// If the value has never been inserted into the union-find, `val` is returned.
     fn get_canon_in_uf(&self, val: Value) -> Value {
         let table = self.db.get_table(self.uf_table);
-        let row = table.get_row(&[val]);
-        row.map(|row| row.vals[1]).unwrap_or(val)
+        // The union table has a direct representative-column lookup. Reading
+        // a complete pooled row here needlessly hashes and allocates for every
+        // canonical value visited by compiler export.
+        table.get_row_column(&[val],ColumnId::new(1)).unwrap_or(val)
     }
 
     /// Get the canonical representation for `val` based on type.
@@ -471,6 +486,20 @@ impl EGraph {
 
     pub fn approx_table_size(&self, table: FunctionId) -> usize {
         self.db.estimate_size(self.funcs[table].table, None)
+    }
+
+    /// Instance and union epoch for immutable compiler snapshots.
+    pub fn snapshot_identity(&self)->(u64,usize) {
+        (self.snapshot_identity.0,self.db.get_table(self.uf_table).len())
+    }
+
+    /// Row offsets alone do not track deletion. Include the live row count;
+    /// replacement appends a row, and compaction/clear changes the generation.
+    pub fn snapshot_table_version(&self,func:FunctionId)->(usize,usize,usize,usize) {
+        let id=self.funcs[func].table;
+        let table=self.db.get_table(id);
+        let version=table.version();
+        (id.index(),version.major.index(),version.minor.index(),table.len())
     }
 
     pub fn table_size(&self, table: FunctionId) -> usize {
@@ -1062,21 +1091,33 @@ impl EGraph {
     /// Flush the pending update buffers to the EGraph.
     /// Returns `true` if the database is updated.
     pub fn flush_updates(&mut self) -> bool {
+        self.flush_updates_checked().expect("update flush failed")
+    }
+
+    /// Flush action-side writes while returning merge/rebuild failures at the
+    /// action that caused them, as `run_rules` does for compiled actions.
+    pub fn flush_updates_checked(&mut self) -> Result<bool> {
         let thread_pool = self.thread_pool();
         install_thread_pool(thread_pool, || self.flush_updates_inner())
     }
 
-    fn flush_updates_inner(&mut self) -> bool {
+    fn flush_updates_inner(&mut self) -> Result<bool> {
         let uf_size_before = self.db.get_table(self.uf_table).len();
         let updated = self.db.merge_all();
+        if let Some(message) = self.panic_message.lock().unwrap().take() {
+            return Err(PanicError(message).into());
+        }
         self.inc_ts();
         let uf_size_after = self.db.get_table(self.uf_table).len();
         if uf_size_before != uf_size_after {
             // Rebuilding is only necessary when new unions have been made because ids may need to be updated.
             // Adding terms doesn't necessarily touch the union-find, only doing a union between existing ids does.
-            self.rebuild().unwrap();
+            self.rebuild()?;
         }
-        updated
+        if let Some(message) = self.panic_message.lock().unwrap().take() {
+            return Err(PanicError(message).into());
+        }
+        Ok(updated)
     }
 
     pub fn set_report_level(&mut self, level: ReportLevel) {
