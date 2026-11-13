@@ -87,3 +87,14 @@ These patches were extracted from Trainium commit
 `f39babf9a2f7f2998b5226fbc5745c117cef5f77` on top of
 `1bb30831e11121bd639caf93d84465d8d110e3f7`, including Luminal's subsumed-insert
 support. Upstream files omitted from the Trainium vendor tree remain intact.
+
+Cached rule plans no longer keep the table subsets computed while planning.
+`RuleSet::build_cached_plan` stores `Plan::without_planning_subsets()`: atoms and
+headers keep their fast/slow constraints, and their subsets are empty, because
+`add_rule_from_cached_plan` reprocesses fast constraints against the live
+database each time. Before this, every constant-constrained atom of every rule
+pinned two copies (atom + header) of the matching row offsets as of the rule's
+first run. With ~61K backend rules this was 19 GB on an empty graph and
+~150 GB for an 8-layer DeepSeek graph. `cached_plans_drop_planning_subsets_and_still_see_new_rows`
+covers it. `(hc as _)` in two removal paths is spelled `HashCode` so the lib test
+target infers the type.

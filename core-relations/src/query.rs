@@ -62,6 +62,15 @@ pub struct RuleSet {
     pub(crate) actions: DenseIdMap<ActionId, ActionInfo>,
 }
 
+#[cfg(test)]
+impl CachedPlan {
+    /// Rows held by the subsets stored in this cached plan (atoms and headers).
+    pub(crate) fn stored_subset_rows(&self) -> usize {
+        let atoms: usize = self.plan.atoms().iter().map(|(_, a)| a.constraints.subset.size()).sum();
+        atoms + self.plan.header().iter().map(|h| h.subset.size()).sum::<usize>()
+    }
+}
+
 impl RuleSet {
     pub fn build_cached_plan(&self, rule_id: RuleId) -> CachedPlan {
         let (plan, desc, symbol_map) = self.plans.get(rule_id).expect("rule must exist");
@@ -71,7 +80,7 @@ impl RuleSet {
             .expect("action must exist")
             .clone();
         CachedPlan {
-            plan: plan.clone(),
+            plan: plan.without_planning_subsets(),
             desc: desc.clone(),
             symbol_map: symbol_map.clone(),
             actions,
