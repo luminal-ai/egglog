@@ -214,6 +214,61 @@ pub(crate) enum Plan {
     DecomposedPlan(DecomposedPlan),
 }
 impl Plan {
+    /// A copy of this plan for [`crate::CachedPlan`] without the table subsets
+    /// computed while planning.
+    ///
+    /// Fast constraints are reprocessed against the current database every
+    /// time a cached plan is added to a rule set (`reprocess_constraints`), so
+    /// neither the atoms' planning subsets nor the header subsets are read
+    /// again. Keeping them would pin one copy of every constant-constrained
+    /// atom's matching rows per rule for the rest of the run, which grows with
+    /// rule count times graph size.
+    pub(crate) fn without_planning_subsets(&self) -> Plan {
+        fn atoms(atoms: &DenseIdMap<AtomId, Atom>) -> Arc<DenseIdMap<AtomId, Atom>> {
+            let mut stripped = DenseIdMap::with_capacity(atoms.n_ids());
+            for (id, atom) in atoms.iter() {
+                stripped.insert(
+                    id,
+                    Atom {
+                        table: atom.table,
+                        var_columns: atom.var_columns.clone(),
+                        constraints: ProcessedConstraints {
+                            subset: Subset::empty(),
+                            fast: Pooled::cloned(&atom.constraints.fast),
+                            slow: Pooled::cloned(&atom.constraints.slow),
+                        },
+                    },
+                );
+            }
+            Arc::new(stripped)
+        }
+        fn header(header: &[JoinHeader]) -> Vec<JoinHeader> {
+            header
+                .iter()
+                .map(|h| JoinHeader {
+                    atom: h.atom,
+                    constraints: Pooled::cloned(&h.constraints),
+                    subset: Arc::new(Subset::empty()),
+                })
+                .collect()
+        }
+        match self {
+            Plan::SinglePlan(p) => Plan::SinglePlan(SinglePlan {
+                atoms: atoms(&p.atoms),
+                header: header(&p.header),
+                stages: p.stages.clone(),
+                actions: p.actions,
+            }),
+            Plan::DecomposedPlan(p) => Plan::DecomposedPlan(DecomposedPlan {
+                atoms: atoms(&p.atoms),
+                header: header(&p.header),
+                stages: p.stages.clone(),
+                result_block: p.result_block.clone(),
+                actions: p.actions,
+            }),
+        }
+    }
+
     pub fn actions(&self) -> ActionId {
         match self {
             Plan::SinglePlan(p) => p.actions,

@@ -1274,6 +1274,57 @@ fn cached_constraints_rebind_atoms_and_refresh_after_table_changes() {
     });
 }
 
+#[test]
+fn cached_plans_drop_planning_subsets_and_still_see_new_rows() {
+    run_serial_and_parallel(|| {
+        let mut db = Database::default();
+        let table = db.add_table(
+            SortedWritesTable::new(1, 2, None, vec![], Box::new(|_, _, _, _| false)),
+            iter::empty(), iter::empty(),
+        );
+        {
+            // Every other row matches the constant: a sparse planning subset.
+            let mut buffer = db.new_buffer(table);
+            for i in 0..1000 { buffer.stage_insert(&[v(i), v(i % 2)]); }
+        }
+        db.merge_all();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let record = db.add_external_function(Box::new(make_external_func(move |_, args| {
+            observed.lock().unwrap().push(args[0]);
+            Some(v(0))
+        })));
+        let mut builder = db.new_rule_set();
+        let mut query = builder.new_rule();
+        let x = query.new_var();
+        query.add_atom(table, &[x.into(), crate::QueryEntry::Const(v(1))], &[]).unwrap();
+        let mut rule = query.build();
+        rule.call_external(record, &[x.into()]).unwrap();
+        let id = rule.build_with_description("odd-rows");
+        let rule_set = builder.build();
+        let cached = rule_set.build_cached_plan(id);
+        drop(rule_set);
+        // Fast constraints are reprocessed on every use, so the cached plan
+        // keeps none of the 500 rows planning saw.
+        assert_eq!(cached.stored_subset_rows(), 0);
+        {
+            let mut buffer = db.new_buffer(table);
+            buffer.stage_insert(&[v(2001), v(1)]);
+            buffer.stage_insert(&[v(2002), v(0)]);
+        }
+        db.merge_all();
+        let mut builder = db.new_rule_set();
+        assert!(builder.add_rule_from_cached_plan(&cached, &[]).is_some());
+        let ruleset = builder.build();
+        db.run_rule_set(&ruleset, ReportLevel::TimeOnly, None);
+        let mut actual = std::mem::take(&mut *seen.lock().unwrap());
+        actual.sort();
+        let mut expected: Vec<_> = (0..1000).filter(|i| i % 2 == 1).map(v).collect();
+        expected.push(v(2001));
+        assert_eq!(actual, expected);
+    });
+}
+
 fn early_stop_inner() {
     let mut db = Database::default();
 
